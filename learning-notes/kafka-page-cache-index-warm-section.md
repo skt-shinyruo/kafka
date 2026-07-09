@@ -1,29 +1,3 @@
----
-title: Kafka Page Cache and Index Warm Section
-description: A technical note on Kafka's page-cache-centric log path and cache-friendly index lookup.
-tags: ['kafka', 'docs', 'implementation', 'page-cache']
-aliases:
-keywords:
-type: docs
----
-
-<!--
- Licensed to the Apache Software Foundation (ASF) under one or more
- contributor license agreements.  See the NOTICE file distributed with
- this work for additional information regarding copyright ownership.
- The ASF licenses this file to You under the Apache License, Version 2.0
- (the "License"); you may not use this file except in compliance with
- the License.  You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
- Unless required by applicable law or agreed to in writing, software
- distributed under the License is distributed on an "AS IS" BASIS,
- WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- See the License for the specific language governing permissions and
- limitations under the License.
--->
-
 # Kafka 为什么这么依赖 Page Cache：从日志写入到索引 Warm Section
 
 很多人第一次看 Kafka 的存储路径时，会自然地把它想象成这样：Broker
