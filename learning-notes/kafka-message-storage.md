@@ -217,18 +217,107 @@ key=B, value=2
 它与普通业务 Topic 的消息日志用途不同。
 
 ## 9. 总体结构
+
 ```text
 Kafka Broker
-└── Topic
-└── Partition
-├── Active Segment
-│   ├── .log
-│   ├── .index
-│   └── .timeindex
-├── Older Segment
-├── Older Segment
-└── Replica / Leader / Follower
+└── Topic-Partition Replica
+    └── UnifiedLog（完整逻辑日志）
+        ├── Remote tier（可选的远程历史 Segment）
+        └── LocalLog（当前 Broker 的本地 Segment）
+            ├── Older LogSegment
+            └── Active LogSegment
+                ├── .log
+                ├── .index
+                ├── .timeindex
+                └── .txnindex
 ```
-## 10. 总结
+
+## 10. LocalLog、UnifiedLog 与远程分层存储
+
+### LocalLog 是什么
+
+`LocalLog` 不是 log4j 这类运行诊断日志，而是某个 Topic-Partition 副本在当前
+Broker 本地磁盘上的追加式消息日志。它管理一组按 base offset 排列的
+`LogSegment`，并负责具体的本地文件操作：
+
+- 向 active segment 追加 RecordBatch；
+- 根据 offset 读取数据；
+- 滚动创建新 Segment；
+- 刷盘并维护 `recoveryPoint`；
+- 维护 LEO（Log End Offset，下一条消息将写入的 offset）；
+- 截断、删除、拆分和替换 Segment；
+- 处理分区日志目录及磁盘 I/O 异常。
+
+`LocalLog` 本身不是线程安全的，它依赖上层 `UnifiedLog` 的锁来保护修改操作。
+
+### UnifiedLog 中的“远程”是什么
+
+`UnifiedLog` 向上层提供一条完整的逻辑日志视图。未开启分层存储时，完整日志
+都由它封装的 `LocalLog` 提供。开启 Tiered Storage 后，完整日志可以同时包含：
+
+```text
+完整逻辑日志 = 远程历史 Segment + 本地 Segment
+```
+
+这里的远程是 S3、HDFS 或其他由插件实现的外部存储系统，**不是其他 Kafka
+Broker 上的 Follower 副本**。`RemoteLogManager` 协调远程 Segment 的复制、读取和清理，
+`RemoteStorageManager` 插件执行实际的 copy、fetch 和 delete。远程 Segment 除了
+`.log` 数据，也包括 offset、time、transaction、leader epoch 等辅助索引。
+
+数据的典型流程是：
+
+```text
+写入消息
+  ↓
+追加到本地 active segment
+  ↓
+Segment 滚动后成为非 active segment
+  ↓
+复制到远程存储
+  ↓
+达到 local.retention.ms/bytes 后可删除本地副本
+```
+
+Active Segment 始终在本地。已上传的旧 Segment 也不会立即从本地删除，因此远程和
+本地区间可以有重叠：
+
+```text
+offset: 0 ---------------- 700 -------- 1000
+        |───── remote ───────|
+                       |────── local ─────|
+                                  ↑ active
+```
+
+当 Consumer 读取的 offset 已不在本地时，Consumer 仍然向 Kafka Broker 发送 Fetch
+请求，由 Broker 从远程存储取回数据；Consumer 不会直接访问对象存储。
+
+### 是否应该开启远程存储
+
+远程分层存储不是 Kafka 正常运行的前提，也不是所有集群都应该默认开启的选项。
+如果没有明确的长期保留需求，只使用本地存储通常更简单，且历史读取延迟更稳定。
+
+适合只使用 `LocalLog` 对应的本地存储的情况：
+
+- 数据只保留几小时或几天；
+- Broker 磁盘容量和成本可接受；
+- 希望维持稳定的低延迟和较小的运维复杂度；
+- 没有经过生产验证的 `RemoteStorageManager` 插件。
+
+适合开启远程分层存储的情况：
+
+- 数据需要保留数周、数月或更久；
+- 数据量很大，长期使用 Broker 本地 SSD 的成本过高；
+- 经常需要回溯、重放或批量处理历史数据；
+- 希望降低 Broker 扩缩容或故障恢复时需要迁移的历史数据量。
+
+使用远程存储会引入更高的历史读取延迟、对象存储请求和流量成本，以及额外的插件、
+监控、权限与故障处理复杂度。当前 Apache Kafka 定义了 `RemoteStorageManager` 接口，
+但不内置生产级 S3/HDFS 实现，需要自行选择和验证插件。
+
+最后，远程存储不能替代 Kafka 的副本机制。例如 `replication.factor=3` 时，分区的
+Leader 和 Follower 仍然分别在多个 Broker 的 `LocalLog` 中保存和同步数据。远程存储
+解决的主要是冷数据容量和成本问题，而副本机制解决的是实时可用性和一致性问题。
+
+## 11. 总结
 
 Kafka 将消息按 Topic-Partition 划分，以 Offset 作为顺序标识，按 RecordBatch 追加写入磁盘上的 Segment 文件，并通过索引快速定位、通过副本保证可靠性、通过保留策略或日志压缩清理旧数据。
